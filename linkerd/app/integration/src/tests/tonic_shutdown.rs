@@ -33,29 +33,35 @@ use std::net::SocketAddr;
 use tonic::service::Routes;
 use tonic::transport::Server as TonicServer;
 use tonic::transport::channel::Change;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use tower::ServiceExt;
 
 /// Size of the client connection pool. Production uses 3500.
 const POOL: usize = 500;
 
-/// Signals on drop, regardless of how the holding future terminated.
-struct SignalOnDrop(Option<oneshot::Sender<()>>);
+/// Runs a closure on drop. Same shape as `OnDrop` in the original
+/// hyper_hung_client_example, so the shutdown plumbing here matches the repro
+/// exactly rather than merely approximating it.
+pub struct OnDrop<F: FnMut()>(pub F);
 
-impl Drop for SignalOnDrop {
+impl<F: FnMut()> Drop for OnDrop<F> {
     fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
+        self.0();
     }
 }
 
 /// A real `tonic::transport::Server`.
+///
+/// Both signals are `CancellationToken`s, matching the repro: `shutdown` is what
+/// `serve_with_incoming_shutdown` awaits, and `drain_complete` is cancelled from
+/// an `OnDrop` guard so it fires however the serve task ends (including a
+/// panic). Unlike a `oneshot`, a token can be awaited repeatedly and observed
+/// without consuming the handle.
 struct TonicUnderTest {
     addr: SocketAddr,
-    shutdown: oneshot::Sender<()>,
-    /// Fires when the serve task's future is DROPPED -- however it ends.
-    drained: oneshot::Receiver<()>,
+    shutdown: CancellationToken,
+    drain_complete: CancellationToken,
     /// What `serve_with_incoming_shutdown` returned, if it returned.
     outcome: Arc<parking_lot::Mutex<Option<Result<(), String>>>>,
     /// TCP connections the tonic server itself accepted.
@@ -69,17 +75,18 @@ impl TonicUnderTest {
 
     /// Triggers graceful shutdown and waits up to `within`.
     /// Returns `(drained_in_time, serve_outcome)`.
-    async fn shutdown_and_wait(self, within: Duration) -> (bool, Option<Result<(), String>>) {
-        let TonicUnderTest {
-            shutdown,
-            drained,
-            outcome,
-            ..
-        } = self;
-        let _ = shutdown.send(());
-        let in_time = tokio::time::timeout(within, drained).await.is_ok();
-        let out = outcome.lock().clone();
+    async fn shutdown_and_wait(&self, within: Duration) -> (bool, Option<Result<(), String>>) {
+        self.shutdown.cancel();
+        let in_time = tokio::time::timeout(within, self.drain_complete.cancelled())
+            .await
+            .is_ok();
+        let out = self.outcome.lock().clone();
         (in_time, out)
+    }
+
+    /// Whether the drain has completed, without waiting.
+    fn is_drained(&self) -> bool {
+        self.drain_complete.is_cancelled()
     }
 }
 
@@ -96,8 +103,8 @@ async fn spawn_tonic() -> TonicUnderTest {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
-    let (drained_tx, drained) = oneshot::channel::<()>();
+    let shutdown = CancellationToken::new();
+    let drain_complete = CancellationToken::new();
 
     let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = accepts.clone();
@@ -110,14 +117,23 @@ async fn spawn_tonic() -> TonicUnderTest {
     let outcome = Arc::new(parking_lot::Mutex::new(None));
     let outcome_w = outcome.clone();
 
+    let shutdown_rx = shutdown.clone();
+    let complete_tx = drain_complete.clone();
+
     tokio::spawn(async move {
-        let _complete = SignalOnDrop(Some(drained_tx));
+        // Cancels on drop, so it fires however this task ends -- including a
+        // panic, which a plain `oneshot` sent after `.await` would misreport as
+        // a clean drain.
+        let _complete = OnDrop(|| {
+            complete_tx.cancel();
+        });
+
         // An empty router is enough: both failure modes live in the transport
         // layer, so no method needs to exist.
         let res = TonicServer::builder()
             .add_routes(Routes::default())
             .serve_with_incoming_shutdown(incoming, async move {
-                let _ = shutdown_rx.await;
+                shutdown_rx.cancelled().await;
             })
             .await
             .map_err(|e| e.to_string());
@@ -127,7 +143,7 @@ async fn spawn_tonic() -> TonicUnderTest {
     TonicUnderTest {
         addr,
         shutdown,
-        drained,
+        drain_complete,
         outcome,
         accepts,
     }
@@ -482,11 +498,18 @@ async fn concurrent_shutdown_case(
         }
         // App drains first, then the sidecar.
         Some(false) => {
-            let fut = srv.shutdown_and_wait(Duration::from_secs(10));
+            // Cancel the app's token first, then the sidecar's, while the
+            // app's drain is still in flight.
+            let app = srv.shutdown.clone();
+            let complete = srv.drain_complete.clone();
+            app.cancel();
             tokio::time::sleep(Duration::from_millis(250)).await;
             proxy_shdn.signal();
-            let (d, o) = fut.await;
-            (d, o, accepted)
+            let in_time = tokio::time::timeout(Duration::from_secs(10), complete.cancelled())
+                .await
+                .is_ok();
+            let out = srv.outcome.lock().clone();
+            (in_time, out, accepted)
         }
         // Both at once (what kubelet actually does).
         None => {
