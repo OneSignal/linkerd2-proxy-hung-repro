@@ -1,11 +1,14 @@
 mod client_policy;
 mod direct;
 mod discovery;
+mod grpc_pool_shutdown;
 mod identity;
 mod orig_proto;
 mod profile_dst_overrides;
 mod profiles;
 mod shutdown;
+mod proxy_dial_probe;
 mod tap;
 mod telemetry;
+mod tonic_shutdown;
 mod transparency;
